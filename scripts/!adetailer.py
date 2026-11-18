@@ -1901,29 +1901,53 @@ class AfterDetailerScript(scripts.Script):
             return None, script_args
 
         ad_only_selected_scripts = opts.data.get("ad_only_selected_scripts", True)
-        if not ad_only_selected_scripts:
-            return script_runner, script_args
+        if ad_only_selected_scripts:
+            ad_script_names_string: str = opts.data.get("ad_script_names", SCRIPT_DEFAULT)
+            ad_script_names = ad_script_names_string.split(",") + BUILTIN_SCRIPT.split(",")
+            script_names_set = {name.strip() for name in ad_script_names}
 
-        ad_script_names_string: str = opts.data.get("ad_script_names", SCRIPT_DEFAULT)
-        ad_script_names = ad_script_names_string.split(",") + BUILTIN_SCRIPT.split(",")
-        script_names_set = {
-            name
-            for script_name in ad_script_names
-            for name in (script_name, script_name.strip())
+            if args.ad_controlnet_model != "None":
+                script_names_set.add("controlnet")
+
+            script_runner.alwayson_scripts = [
+                script for script in script_runner.alwayson_scripts
+                if Path(script.filename).stem in script_names_set
+            ]
+
+        # The outer image still needs its Soft inpainting overlay after
+        # ADetailer's nested generation returns.
+        soft_copies = {
+            id(script): copy(script) for script in script_runner.alwayson_scripts
+            if Path(script.filename).stem == "soft_inpainting"
         }
+        if soft_copies:
+            script_runner.alwayson_scripts = [
+                soft_copies.get(id(script), script) for script in script_runner.alwayson_scripts
+            ]
+            if hasattr(script_runner, "scripts"):
+                script_runner.scripts = [
+                    soft_copies.get(id(script), script) for script in script_runner.scripts
+                ]
+            if hasattr(script_runner, "title_map"):
+                script_runner.title_map = {
+                    title: soft_copies.get(id(script), script)
+                    for title, script in script_runner.title_map.items()
+                }
+            self.clear_soft_inpainting_overlay(script_runner)
 
-        if args.ad_controlnet_model != "None":
-            script_names_set.add("controlnet")
-
-        filtered_alwayson = []
-        for script_object in script_runner.alwayson_scripts:
-            filepath = script_object.filename
-            filename = Path(filepath).stem
-            if filename in script_names_set:
-                filtered_alwayson.append(script_object)
-
-        script_runner.alwayson_scripts = filtered_alwayson
+        # Forge caches callbacks on the runner by list size. A shallow copy
+        # can otherwise invoke the outer script even when our list is correct.
+        if hasattr(script_runner, "callback_map"):
+            script_runner.callback_map = {}
         return script_runner, script_args
+
+    @staticmethod
+    def clear_soft_inpainting_overlay(script_runner):
+        for script in getattr(script_runner, "alwayson_scripts", ()):
+            if Path(script.filename).stem == "soft_inpainting":
+                for attr in ("overlay_images", "masks_for_overlay"):
+                    if hasattr(script, attr):
+                        setattr(script, attr, None)
 
     def disable_controlnet_units(self, script_args: Sequence[Any]) -> list[Any]:
         new_args = []
@@ -3707,6 +3731,8 @@ class AfterDetailerScript(scripts.Script):
             region_start = p2.init_images[0] if region_opacity < 100 else None
 
             try:
+                # A tab can reuse its runner for multiple detection regions.
+                self.clear_soft_inpainting_overlay(getattr(p2, "scripts", None))
                 processed = process_images(p2)
             except NansException as e:
                 msg = f"[-] ADetailer: 'NansException' occurred with {ordinal(n + 1)} settings.\n{e}"

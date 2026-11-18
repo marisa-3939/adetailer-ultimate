@@ -55,16 +55,71 @@ def _load_runtime(**host_globals):
                 if isinstance(method, ast.FunctionDef)
                 and method.name in {
                     "process", "set_skip_img2img", "_postprocess_image_inner",
-                    "_drop_api_default_tab",
+                    "_drop_api_default_tab", "script_args_copy", "script_filter",
+                    "clear_soft_inpainting_overlay",
                 }
             ]
             for method in node.body:
-                method.decorator_list = []
+                method.decorator_list = [
+                    decorator for decorator in method.decorator_list
+                    if isinstance(decorator, ast.Name) and decorator.id == "staticmethod"
+                ]
             selected.append(node)
     namespace = {"Path": Path, "sys": sys, "re": re, **_NETWORK_HASHES, **host_globals}
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(_SCRIPT_PATH), "exec"), namespace)
     return SimpleNamespace(**namespace)
+
+
+@pytest.mark.parametrize("selected_only", [True, False])
+def test_nested_soft_inpainting_keeps_outer_overlay_and_warm_callbacks(selected_only):
+    runtime = _load_runtime(
+        copy=copy,
+        opts=SimpleNamespace(data={"ad_only_selected_scripts": selected_only}),
+        SCRIPT_DEFAULT="",
+        BUILTIN_SCRIPT="soft_inpainting",
+    )
+    detailer = runtime.AfterDetailerScript()
+    outer_overlay = [object(), object()]
+    outer_masks = [object(), object()]
+    soft = SimpleNamespace(
+        filename="soft_inpainting.py",
+        args_from=2,
+        args_to=9,
+        overlay_images=outer_overlay,
+        masks_for_overlay=outer_masks,
+    )
+    unrelated = SimpleNamespace(filename="unrelated.py")
+    outer = SimpleNamespace(
+        alwayson_scripts=[soft, unrelated],
+        scripts=[soft, unrelated],
+        title_map={"soft inpainting": soft},
+        callback_map={"script_post_sample": (2, [SimpleNamespace(callback=soft)])},
+    )
+    original_args = (0, None, True, 1, 0.5, 4, 0, 0.5, 2)
+    parent = SimpleNamespace(scripts=outer, script_args=original_args)
+    detailer_args = SimpleNamespace(ad_controlnet_model="None")
+
+    child, copied_args = detailer.script_filter(parent, detailer_args)
+    nested_soft = child.alwayson_scripts[0]
+    assert nested_soft is not soft
+    assert child.scripts[0] is child.title_map["soft inpainting"] is nested_soft
+    assert child.alwayson_scripts == ([nested_soft] if selected_only else [nested_soft, unrelated])
+    assert copied_args[nested_soft.args_from:nested_soft.args_to] == original_args[2:9]
+    assert child.callback_map == {}
+    assert outer.callback_map["script_post_sample"][1][0].callback is soft
+
+    for _ in range(2):
+        assert nested_soft.overlay_images is nested_soft.masks_for_overlay is None
+        nested_soft.overlay_images = [object()]
+        nested_soft.masks_for_overlay = [object()]
+        detailer.clear_soft_inpainting_overlay(child)
+        assert soft.overlay_images is outer_overlay
+        assert soft.masks_for_overlay is outer_masks
+        assert outer.alwayson_scripts[0] is outer.scripts[0] is soft
+
+    next_child, _ = detailer.script_filter(parent, detailer_args)
+    assert next_child.alwayson_scripts[0] is not nested_soft
 
 
 @pytest.mark.parametrize("manual_mode", [True, False])
@@ -557,6 +612,8 @@ def _load_script(methods=(), functions=(), assigns=(), **host_globals):
     if "_postprocess_image_inner" in methods:
         functions = {*functions, "_empty_prompt_note", "_strip_host_comments"}
         assigns = {*assigns, "_PROMPT_TOKEN_RE"}
+    if {"script_filter", "_postprocess_image_inner"} & set(methods):
+        methods = {*methods, "clear_soft_inpainting_overlay"}
     # And the "applied ad_prompt" line, which ignores the removed comments.
     if "compare_prompt" in methods:
         functions = {*functions, "_strip_host_comments"}
@@ -633,8 +690,16 @@ def test_region_after_a_nan_error_gets_its_own_dynamic_denoise():
         class_names=[],
     )
     seen = []
+    nested_soft = SimpleNamespace(
+        filename="soft_inpainting.py",
+        overlay_images=[object()],
+        masks_for_overlay=[object()],
+    )
 
     def process_images(p2):
+        assert nested_soft.overlay_images is nested_soft.masks_for_overlay is None
+        nested_soft.overlay_images = [object()]
+        nested_soft.masks_for_overlay = [object()]
         seen.append((round(p2.denoising_strength, 4), p2.width, p2.height))
         if len(seen) == 1:
             raise nans("NaN in the first region")
@@ -676,6 +741,7 @@ def test_region_after_a_nan_error_gets_its_own_dynamic_denoise():
     script.get_i2i_p = lambda *_args: SimpleNamespace(
         init_images=[image], prompt="face", negative_prompt="",
         close=lambda: None, denoising_strength=0.4, width=512, height=512,
+        scripts=SimpleNamespace(alwayson_scripts=[nested_soft]),
     )
     script.get_prompt = lambda *_args: (["face"], [""])
     script.get_ad_model = lambda _name: "model.pt"
